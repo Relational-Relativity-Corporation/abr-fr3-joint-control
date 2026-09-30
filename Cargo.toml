@@ -1,0 +1,22 @@
+[package]
+name = "abr-fr3-joint-control"
+version = "0.1.0"
+edition = "2021"
+description = "ABR relational control on Franka Research 3 joint observables"
+license = "Apache-2.0"
+
+[[bin]]
+name = "simulate"
+path = "bin/simulate.rs"
+
+[[bin]]
+name = "verify"
+path = "bin/verify.rs"
+
+[lib]
+name = "abr_fr3"
+path = "src/lib.rs"
+
+[dependencies]
+# No nalgebra. No external physics engine.
+# Kernel V8 vendored inline per Repository Protocol.
