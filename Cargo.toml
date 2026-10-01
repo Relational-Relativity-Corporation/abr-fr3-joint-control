@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-abr-kernel = { package = "metatron_kernel_v8", git = "https://github.com/Relational-Relativity-Corporation/abr-kernel", branch = "main" }
+abr-kernel = { git = "https://github.com/Relational-Relativity-Corporation/abr-kernel", branch = "main" }
 pyo3 = { version = "0.22", features = ["extension-module"] }
 
 [lib]
