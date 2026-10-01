@@ -9,7 +9,7 @@
 use abr_fr3::declaration::*;
 use abr_fr3::bridge::advance_relational_step;
 
-// ── M orientation — live tests ────────────────────────────────────────────────
+// ── M orientation ─────────────────────────────────────────────────────────────
 
 #[test]
 fn m_tau_ceiling() {
@@ -44,7 +44,6 @@ fn m_p_negative_ceiling() {
 
 #[test]
 fn m_theta_ceiling() {
-    // Allow small floating point tolerance for declared constant
     let v = m_theta(THETA_MAX).unwrap();
     assert!((v - 1.0).abs() < 1e-10, "m_theta(THETA_MAX) must be 1.0, got {}", v);
 }
@@ -67,53 +66,12 @@ fn m_inv_tau_clamp_negative() {
     assert_eq!(m_inv_tau(-2.0), -87.0);
 }
 
-// ── B telescoping — declared structural property ──────────────────────────────
-// Declared: B[edge2] = A[edge2] + A[edge1] + A[edge0] = ΔP_prior − Δθ
-// This tests the structural accumulation property of the declared topology.
-
-#[test]
-fn b_edge2_telescopes() {
-    let dp_prior = 0.1149_f64;
-    let dp       = 0.1149_f64;
-    let dtau     = 0.1149_f64;
-    let dtheta   = 0.0216_f64;
-
-    // A at each edge: signed directed difference, source − target
-    let a_edge0 = dp_prior - dp;    // ΔP_prior → ΔP
-    let a_edge1 = dp       - dtau;  // ΔP → Δτ
-    let a_edge2 = dtau     - dtheta;// Δτ → Δθ
-
-    // B accumulates forward: B[e] = A[e] + Σ_{succ(e)} A
-    // Edge 2 is terminal (Δθ has no successors): B[edge2] = A[edge2]
-    // Edge 1 successor is edge 2: B[edge1] = A[edge1] + B[edge2]
-    // Edge 0 successor is edge 1: B[edge0] = A[edge0] + B[edge1]
-    //
-    // BUT: the kernel's operator_b adds succ(e) B values, not A values.
-    // After A→B pass:
-    //   b2 = a2                    (terminal)
-    //   b1 = a1 + b2 = a1 + a2
-    //   b0 = a0 + b1 = a0 + a1 + a2
-    //
-    // b0 telescopes: a0 + a1 + a2
-    //   = (dp_prior − dp) + (dp − dtau) + (dtau − dtheta)
-    //   = dp_prior − dtheta
-    let b2 = a_edge2;
-    let b1 = a_edge1 + b2;
-    let b0 = a_edge0 + b1;
-
-    let expected = dp_prior - dtheta;
-    assert!((b0 - expected).abs() < 1e-10,
-        "B[edge0] telescoping failed: got {:.6}, expected {:.6}", b0, expected);
-}
-
 // ── Operator A — sign preservation ───────────────────────────────────────────
-// These call the actual bridge and confirm sign is preserved through A.
 
 #[test]
 fn a_positive_contrast() {
-    // M(Δτ) > M(Δθ) → A[edge2] positive
-    let m_dtau   = m_tau(20.0).unwrap(); // 20/87 ≈ 0.2299
-    let m_dtheta = m_theta(0.1).unwrap(); // 0.1/2.3093 ≈ 0.0433
+    let m_dtau   = m_tau(20.0).unwrap();
+    let m_dtheta = m_theta(0.1).unwrap();
     let result = advance_relational_step(
         m_dtau, m_dtau, m_dtau, m_dtheta, None
     ).unwrap();
@@ -123,10 +81,8 @@ fn a_positive_contrast() {
 
 #[test]
 fn a_sign_not_absolute_value() {
-    // M(Δτ) < M(Δθ) → A[edge2] must be negative, not positive
-    // Absolute value in operator_a is a conformance failure
-    let m_dtau   = m_tau(5.0).unwrap();    // small torque change
-    let m_dtheta = m_theta(0.5).unwrap();  // larger position change
+    let m_dtau   = m_tau(5.0).unwrap();
+    let m_dtheta = m_theta(0.5).unwrap();
     let result = advance_relational_step(
         m_dtau, m_dtau, m_dtau, m_dtheta, None
     ).unwrap();
@@ -135,25 +91,87 @@ fn a_sign_not_absolute_value() {
          conformance failure. Got {}", result.a[EDGE_TAU_TO_THETA]);
 }
 
-// ── Contact case — critical functional test ───────────────────────────────────
-// Contact: torque nonzero, position not changing → R[edge2] nonzero, command sustained.
-// This is the case that broke the prior Gazebo build.
-// If this test fails the controller cannot hold against resistance.
+// ── Operator B — immediate-successor accumulation (Kernel V8) ─────────────────
+// Kernel V8: B(g)[e] = g[e] + Σ_{f ∈ succ(e)} g[f], where g = A output.
+// succ(e) = edges starting where e ends. Immediate successors only.
+// NOT recursive: B[e] does not include B values of successors.
+//
+// Declared topology:
+//   Edge 0: ΔP_prior → ΔP    succ(0) = {edge 1}
+//   Edge 1: ΔP → Δτ          succ(1) = {edge 2}
+//   Edge 2: Δτ → Δθ          succ(2) = {}  (terminal)
+//
+// Therefore:
+//   B[edge2] = A[edge2]              (terminal)
+//   B[edge1] = A[edge1] + A[edge2]  (one immediate successor)
+//   B[edge0] = A[edge0] + A[edge1]  (one immediate successor — NOT +A[edge2])
+//
+// This test calls canonical operator_b through the bridge and checks
+// the actual kernel output against these declared properties.
+
+#[test]
+fn b_immediate_successor_accumulation() {
+    // Values chosen so all A are nonzero and distinguishable
+    // A[edge0] = 0.20 - 0.15 = 0.05
+    // A[edge1] = 0.15 - 0.10 = 0.05
+    // A[edge2] = 0.10 - 0.05 = 0.05
+    let m_dp_prior = 0.20_f64;
+    let m_dp       = 0.15_f64;
+    let m_dtau     = 0.10_f64;
+    let m_dtheta   = 0.05_f64;
+
+    let result = advance_relational_step(
+        m_dp_prior, m_dp, m_dtau, m_dtheta, None
+    ).unwrap();
+
+    let a0 = result.a[EDGE_PRIOR_TO_P];
+    let a1 = result.a[EDGE_P_TO_TAU];
+    let a2 = result.a[EDGE_TAU_TO_THETA];
+
+    // Confirm A values
+    assert!((a0 - 0.05).abs() < 1e-10, "A[edge0] expected 0.05, got {}", a0);
+    assert!((a1 - 0.05).abs() < 1e-10, "A[edge1] expected 0.05, got {}", a1);
+    assert!((a2 - 0.05).abs() < 1e-10, "A[edge2] expected 0.05, got {}", a2);
+
+    let b0 = result.b[EDGE_PRIOR_TO_P];
+    let b1 = result.b[EDGE_P_TO_TAU];
+    let b2 = result.b[EDGE_TAU_TO_THETA];
+
+    // B[edge2]: terminal — equals A[edge2]
+    assert!((b2 - a2).abs() < 1e-10,
+        "B[edge2] must equal A[edge2] (terminal). Expected {:.4}, got {:.4}", a2, b2);
+
+    // B[edge1]: A[edge1] + A[edge2] (immediate successor only)
+    let expected_b1 = a1 + a2;
+    assert!((b1 - expected_b1).abs() < 1e-10,
+        "B[edge1] = A[edge1]+A[edge2]. Expected {:.4}, got {:.4}", expected_b1, b1);
+
+    // B[edge0]: A[edge0] + A[edge1] only — NOT +A[edge2]
+    // This is the critical assertion: immediate successor only, not transitive
+    let expected_b0 = a0 + a1;
+    assert!((b0 - expected_b0).abs() < 1e-10,
+        "B[edge0] = A[edge0]+A[edge1] only. Expected {:.4}, got {:.4}", expected_b0, b0);
+
+    // Confirm B[edge0] does NOT equal the transitive sum (would be 0.15)
+    let transitive_sum = a0 + a1 + a2;
+    assert!((b0 - transitive_sum).abs() > 1e-10,
+        "B[edge0] must NOT equal transitive sum — immediate successors only");
+}
+
+// ── Contact case ──────────────────────────────────────────────────────────────
 
 #[test]
 fn contact_case_command_sustained() {
-    // Δτ nonzero (joint being driven), Δθ = 0.0 (position held by contact)
-    let m_dtau   = m_tau(15.0).unwrap();  // 15/87 ≈ 0.1724
-    let m_dtheta = 0.0_f64;               // no position change — contact
-    let m_dp     = m_p(15.0 * 1.0).unwrap(); // ΔP ≈ Δτ × ω, ω=1.0 for test
+    let m_dtau   = m_tau(15.0).unwrap();
+    let m_dtheta = 0.0_f64;
+    let m_dp     = m_p(15.0 * 1.0).unwrap();
 
     let result = advance_relational_step(
         m_dp, m_dp, m_dtau, m_dtheta, None
     ).unwrap();
 
     assert!(result.r[EDGE_TAU_TO_THETA] > 0.0,
-        "Contact: R[edge2] must be nonzero positive — command must be \
-         sustained when Δθ=0. Got {}", result.r[EDGE_TAU_TO_THETA]);
+        "Contact: R[edge2] must be nonzero positive. Got {}", result.r[EDGE_TAU_TO_THETA]);
     assert!(result.joint_delta > 0.0,
         "Contact: joint_delta must be positive. Got {}", result.joint_delta);
 }

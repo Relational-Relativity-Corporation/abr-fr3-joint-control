@@ -16,6 +16,7 @@
 
 use pyo3::prelude::*;
 use abr_kernel::operators::{
+    operator_a, operator_b, compute_rho, operator_r,
     operator_e, operator_e_v5,
     EdgeField, PersistenceState,
 };
@@ -38,17 +39,21 @@ pub struct StepResult {
     #[pyo3(get)]
     pub b: Vec<f64>,
 
-    /// R values — resolved field at each edge (spatial + persistence if Phase 2)
+    /// R values — spatial R at each edge (for display trace)
     #[pyo3(get)]
     pub r: Vec<f64>,
 
-    /// Joint torque command in N·m — M⁻¹(R[edge2])
-    /// Edge 2 (Δτ → Δθ) is the causal terminal edge — what drives the joint.
+    /// Joint torque command in N·m.
+    /// Phase 1 (first step): M⁻¹(E_spatial[edge2])
+    /// Phase 2 (subsequent): M⁻¹(E_v5[edge2])
+    /// In both cases driven directly by the established kernel output,
+    /// not by any bridge-constructed combination.
     #[pyo3(get)]
     pub joint_delta: f64,
 
-    /// Spatial EdgeField output — pass as prior_e_spatial on the next step
-    /// to activate Phase 2 (persistence). Serialized as Vec<Vec<f64>>.
+    /// E_spatial output — pass as prior_e_spatial on the next step
+    /// to activate Phase 2 (PersistenceState::from_prior).
+    /// This is the kernel's EdgeField.spatial, carried forward as declared.
     #[pyo3(get)]
     pub e_spatial: Vec<Vec<f64>>,
 }
@@ -70,15 +75,17 @@ impl StepResult {
 /// All inputs are dimensionless — already projected through M by the caller.
 /// Use declaration::m_tau(), m_p(), m_theta() to orient physical values.
 ///
-/// Args:
-///   m_dp_prior       — M(ΔP) from the prior step (dimensionless)
-///   m_dp             — M(ΔP) current step (dimensionless)
-///   m_dtau           — M(Δτ) current step (dimensionless)
-///   m_dtheta         — M(Δθ) current step (dimensionless)
-///   prior_e_spatial  — None on first step; pass result.e_spatial from prior
-///                      step to activate Phase 2 persistence evaluation
+/// Phase 1 (prior_e_spatial = None): spatial kernel only — operator_e.
+///   Kernel V8: first declared observation, only spatial kernel evaluated.
+///   Command = M⁻¹(E_spatial.spatial[0][EDGE_TAU_TO_THETA])
 ///
-/// Returns: StepResult with A, B, R per edge and joint_delta in N·m
+/// Phase 2 (prior_e_spatial = Some(...)): full kernel — operator_e_v5.
+///   Kernel V8: PersistenceState::from_prior(e_prior); A_p → B_p → R_p.
+///   Command = M⁻¹(E_v5.spatial[0][EDGE_TAU_TO_THETA])
+///
+/// In both phases the command is driven directly by the established kernel
+/// output at the causal terminal edge (EDGE_TAU_TO_THETA). No bridge-invented
+/// combination of spatial and persistence outputs is used.
 #[pyfunction]
 #[pyo3(signature = (m_dp_prior, m_dp, m_dtau, m_dtheta, prior_e_spatial=None))]
 pub fn advance_relational_step(
@@ -93,53 +100,53 @@ pub fn advance_relational_step(
     let pairs: &[(usize, usize)] = &[]; // no component pairs declared
     let cc: &[f64]               = &[]; // no cross-topology coupling declared
 
-    let (e_spatial, a_vals, b_vals, r_vals) = match prior_e_spatial {
+    // Spatial A, B, R — computed in all cases for the display trace.
+    // These are the established kernel intermediates, exposed for visualization.
+    // They are NOT used to drive the actuator — the established E output is.
+    let a   = operator_a(&field, &rel, pairs);
+    let rho = compute_rho(&a, &rel, RHO_BASE, CHI0_TAU);
+    let b   = operator_b(&a, &rel);
+    let r   = operator_r(&b, &rel, &rho, cc);
+
+    let a_vals: Vec<f64> = a.spatial[0].clone();
+    let b_vals: Vec<f64> = b.spatial[0].clone();
+    let r_vals: Vec<f64> = r.spatial[0].clone();
+
+    let (e_out, joint_delta) = match prior_e_spatial {
         None => {
-            // Phase 1 only — first declared observation
+            // Phase 1 — first declared observation. Spatial kernel only.
+            // Kernel V8: at the first declared observation, only the spatial
+            // kernel is evaluated. operator_e = R(B(A(x)), ρ(A(x))).
             let e = operator_e(&field, &rel, pairs, cc, RHO_BASE, CHI0_TAU);
-            // Reconstruct A and B for the trace — re-run to expose intermediates
-            use abr_kernel::operators::{operator_a, operator_b, compute_rho, operator_r};
-            let a = operator_a(&field, &rel, pairs);
-            let rho = compute_rho(&a, &rel, RHO_BASE, CHI0_TAU);
-            let b = operator_b(&a, &rel);
-            let r = operator_r(&b, &rel, &rho, cc);
-            let a_v = a.spatial[0].clone();
-            let b_v = b.spatial[0].clone();
-            let r_v = r.spatial[0].clone();
-            (e, a_v, b_v, r_v)
+            let cmd = m_inv_tau(e.spatial[0][EDGE_TAU_TO_THETA]);
+            (e.spatial, cmd)
         }
         Some(prior_spatial) => {
-            // Phase 2 — prior step exists, activate persistence
+            // Phase 2 — prior declared observation exists. Full kernel.
+            // Kernel V8: PersistenceState::from_prior requires actual
+            // observation output — not a model or static configuration.
+            // operator_e_v5 evaluates Phase 1 then A_p → B_p → R_p.
+            // Command is driven by E_v5.spatial[0][EDGE_TAU_TO_THETA] —
+            // the established kernel output at the causal terminal edge.
+            // No combination with persistence output is introduced here.
             let prior_ef = EdgeField {
-                spatial:     prior_spatial,
-                comp:        vec![],
-                comp_pairs:  vec![],
-                k:           1,
+                spatial:    prior_spatial,
+                comp:       vec![],
+                comp_pairs: vec![],
+                k:          1,
             };
             let prior_state = PersistenceState::from_prior(prior_ef);
-            let (e, persistence) = operator_e_v5(
-                &field, &rel, pairs, cc, &prior_state, RHO_BASE, CHI0_TAU
+            let (e, _persistence) = operator_e_v5(
+                &field, &rel, pairs, cc, &prior_state, RHO_BASE, CHI0_TAU,
             );
-            // Spatial A and B for trace
-            use abr_kernel::operators::{operator_a, operator_b, compute_rho, operator_r};
-            let a = operator_a(&field, &rel, pairs);
-            let rho = compute_rho(&a, &rel, RHO_BASE, CHI0_TAU);
-            let b = operator_b(&a, &rel);
-            let r = operator_r(&b, &rel, &rho, cc);
-            // R_final = R_spatial + R_persistence (combined)
-            let r_combined: Vec<f64> = r.spatial[0].iter().enumerate()
-                .map(|(i, &rv)| rv + persistence.r_persistence[0][i])
-                .collect();
-            let a_v = a.spatial[0].clone();
-            let b_v = b.spatial[0].clone();
-            (e, a_v, b_v, r_combined)
+            // _persistence (A_p, B_p, R_p) is available for future declared
+            // use. It is not combined with E_v5 here — no such combination
+            // is established by Kernel V8. Return to Origin if persistence
+            // output should drive the actuator or enter the field.
+            let cmd = m_inv_tau(e.spatial[0][EDGE_TAU_TO_THETA]);
+            (e.spatial, cmd)
         }
     };
-
-    // Command: R at edge 2 (Δτ → Δθ) — causal terminal edge
-    let r_edge2    = r_vals[EDGE_TAU_TO_THETA];
-    let joint_delta = m_inv_tau(r_edge2);
-    let e_out       = e_spatial.spatial.clone();
 
     Ok(StepResult {
         a: a_vals,
@@ -150,8 +157,7 @@ pub fn advance_relational_step(
     })
 }
 
-
-// -- PyO3 0.22 module registration ---------------------------------------------
+// ── PyO3 0.22 module registration ─────────────────────────────────────────────
 
 #[pymodule]
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
