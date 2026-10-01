@@ -1,22 +1,12 @@
 [package]
-name = "abr-fr3-joint-control"
+name = "abr-fr3-blender-demo"
 version = "0.1.0"
 edition = "2021"
-description = "ABR relational control on Franka Research 3 joint observables"
-license = "Apache-2.0"
 
-[[bin]]
-name = "simulate"
-path = "bin/simulate.rs"
-
-[[bin]]
-name = "verify"
-path = "bin/verify.rs"
+[dependencies]
+abr-kernel = { package = "metatron_kernel_v8", git = "https://github.com/Relational-Relativity-Corporation/abr-kernel", branch = "main" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
 
 [lib]
 name = "abr_fr3"
-path = "src/lib.rs"
-
-[dependencies]
-# No nalgebra. No external physics engine.
-# Kernel V8 vendored inline per Repository Protocol.
+crate-type = ["cdylib", "rlib"]
