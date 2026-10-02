@@ -1,18 +1,23 @@
 // PyO3 bridge — exposes one relational step to Python (Blender).
 // Metatron Dynamics, Inc. — relationalrelativity.dev
+// V0.2.2 Verifier PASS — V-1 and V-2 closed.
 //
 // The bridge introduces no operator, no parameter, no topology.
 // Everything is declared in declaration.rs and passed through unchanged.
 // The canonical abr_kernel operators execute. The bridge is a display window
 // into the operator chain — not a reimplementation of it.
 //
-// Python call (from Blender):
-//   import abr_fr3
-//   result = abr_fr3.advance_relational_step(
-//       m_dp_prior, m_dp, m_dtau, m_dtheta,
-//       prior_e_spatial=None   # None on first step; pass result.e_spatial after
-//   )
-//   joint_delta = result.joint_delta   # physical torque command in N·m
+// Phase 1 (prior_e_spatial = None): spatial kernel only — operator_e.
+//   Command = M⁻¹(E_spatial.spatial[0][EDGE_TAU_TO_THETA])
+//
+// Phase 2 (prior_e_spatial = Some(...)): full kernel — operator_e_v5.
+//   Command = M⁻¹(E_v5.spatial[0][EDGE_TAU_TO_THETA])
+//
+// In both phases the command is driven directly by the established kernel
+// output at the causal terminal edge. No bridge-invented combination used.
+//
+// Rest state: called with all zeros — field resolves to zero throughout.
+// A=0, B=0, R=0, joint_delta=0. Declared ground before motion begins.
 
 use pyo3::prelude::*;
 use abr_kernel::operators::{
@@ -26,7 +31,7 @@ use crate::declaration::{
     EDGE_TAU_TO_THETA,
 };
 
-// ── StepResult — returned to Python per relational step ──────────────────────
+// ── StepResult ────────────────────────────────────────────────────────────────
 
 #[pyclass]
 #[derive(Clone, Debug)]
@@ -43,17 +48,13 @@ pub struct StepResult {
     #[pyo3(get)]
     pub r: Vec<f64>,
 
-    /// Joint torque command in N·m.
-    /// Phase 1 (first step): M⁻¹(E_spatial[edge2])
-    /// Phase 2 (subsequent): M⁻¹(E_v5[edge2])
-    /// In both cases driven directly by the established kernel output,
-    /// not by any bridge-constructed combination.
+    /// Joint torque command in N·m — M⁻¹(E[EDGE_TAU_TO_THETA])
+    /// Driven directly by established kernel output at causal terminal edge.
     #[pyo3(get)]
     pub joint_delta: f64,
 
     /// E_spatial output — pass as prior_e_spatial on the next step
-    /// to activate Phase 2 (PersistenceState::from_prior).
-    /// This is the kernel's EdgeField.spatial, carried forward as declared.
+    /// to activate Phase 2 persistence evaluation.
     #[pyo3(get)]
     pub e_spatial: Vec<Vec<f64>>,
 }
@@ -70,22 +71,6 @@ impl StepResult {
 
 // ── advance_relational_step ───────────────────────────────────────────────────
 
-/// Advance the declared FR3 joint 1 relational field by one step.
-///
-/// All inputs are dimensionless — already projected through M by the caller.
-/// Use declaration::m_tau(), m_p(), m_theta() to orient physical values.
-///
-/// Phase 1 (prior_e_spatial = None): spatial kernel only — operator_e.
-///   Kernel V8: first declared observation, only spatial kernel evaluated.
-///   Command = M⁻¹(E_spatial.spatial[0][EDGE_TAU_TO_THETA])
-///
-/// Phase 2 (prior_e_spatial = Some(...)): full kernel — operator_e_v5.
-///   Kernel V8: PersistenceState::from_prior(e_prior); A_p → B_p → R_p.
-///   Command = M⁻¹(E_v5.spatial[0][EDGE_TAU_TO_THETA])
-///
-/// In both phases the command is driven directly by the established kernel
-/// output at the causal terminal edge (EDGE_TAU_TO_THETA). No bridge-invented
-/// combination of spatial and persistence outputs is used.
 #[pyfunction]
 #[pyo3(signature = (m_dp_prior, m_dp, m_dtau, m_dtheta, prior_e_spatial=None))]
 pub fn advance_relational_step(
@@ -97,12 +82,10 @@ pub fn advance_relational_step(
 ) -> PyResult<StepResult> {
     let rel     = declared_topology();
     let field   = build_node_field(m_dp_prior, m_dp, m_dtau, m_dtheta);
-    let pairs: &[(usize, usize)] = &[]; // no component pairs declared
-    let cc: &[f64]               = &[]; // no cross-topology coupling declared
+    let pairs: &[(usize, usize)] = &[];
+    let cc: &[f64]               = &[];
 
-    // Spatial A, B, R — computed in all cases for the display trace.
-    // These are the established kernel intermediates, exposed for visualization.
-    // They are NOT used to drive the actuator — the established E output is.
+    // Spatial A, B, R — computed for display trace in all cases
     let a   = operator_a(&field, &rel, pairs);
     let rho = compute_rho(&a, &rel, RHO_BASE, CHI0_TAU);
     let b   = operator_b(&a, &rel);
@@ -116,7 +99,7 @@ pub fn advance_relational_step(
         None => {
             // Phase 1 — first declared observation. Spatial kernel only.
             // Kernel V8: at the first declared observation, only the spatial
-            // kernel is evaluated. operator_e = R(B(A(x)), ρ(A(x))).
+            // kernel is evaluated.
             let e = operator_e(&field, &rel, pairs, cc, RHO_BASE, CHI0_TAU);
             let cmd = m_inv_tau(e.spatial[0][EDGE_TAU_TO_THETA]);
             (e.spatial, cmd)
@@ -125,10 +108,6 @@ pub fn advance_relational_step(
             // Phase 2 — prior declared observation exists. Full kernel.
             // Kernel V8: PersistenceState::from_prior requires actual
             // observation output — not a model or static configuration.
-            // operator_e_v5 evaluates Phase 1 then A_p → B_p → R_p.
-            // Command is driven by E_v5.spatial[0][EDGE_TAU_TO_THETA] —
-            // the established kernel output at the causal terminal edge.
-            // No combination with persistence output is introduced here.
             let prior_ef = EdgeField {
                 spatial:    prior_spatial,
                 comp:       vec![],
@@ -139,10 +118,10 @@ pub fn advance_relational_step(
             let (e, _persistence) = operator_e_v5(
                 &field, &rel, pairs, cc, &prior_state, RHO_BASE, CHI0_TAU,
             );
-            // _persistence (A_p, B_p, R_p) is available for future declared
-            // use. It is not combined with E_v5 here — no such combination
-            // is established by Kernel V8. Return to Origin if persistence
-            // output should drive the actuator or enter the field.
+            // _persistence (A_p, B_p, R_p) available for future declared use.
+            // Not combined with E_v5 here — no such combination established
+            // by Kernel V8. Return to Origin if persistence output should
+            // drive the actuator or enter the field.
             let cmd = m_inv_tau(e.spatial[0][EDGE_TAU_TO_THETA]);
             (e.spatial, cmd)
         }
